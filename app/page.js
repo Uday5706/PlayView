@@ -1,8 +1,9 @@
 'use client'
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { 
   RotateCw, Play, Pause, Maximize, 
-  ListVideo, Focus, Volume2, VolumeX, MapPin
+  ListVideo, Focus, Volume2, VolumeX, MapPin,
+  SkipForward, SkipBack // <-- ADD THESE TWO
 } from "lucide-react";
 
 const PLAYBACK_SPEEDS = [1, 1.25, 1.5, 1.75, 2];
@@ -17,7 +18,10 @@ export default function Home() {
   const [currentVideo, setCurrentVideo] = useState(null);
   const [playbackRate, setPlaybackRate] = useState(PLAYBACK_SPEEDS[0]);
   
-  // --- ONE-SHOT MODE STATES ---
+  // --- NEW FEATURE STATE ---
+  // Controls how many videos are loaded into One-Shot mode
+  const [oneShotLimit, setOneShotLimit] = useState(0); 
+
   const [isOneShotMode, setIsOneShotMode] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(false);
@@ -27,26 +31,64 @@ export default function Home() {
   const playerRef = useRef(null);
   const rateRef = useRef(playbackRate);
   const progressIntervalRef = useRef(null);
+  
+  // --- BUG FIX REF ---
+  // Instantly tracks progress to prevent the "2-hour jump" on rapid key presses
+  const globalProgressRef = useRef(0);
 
   useEffect(() => { rateRef.current = playbackRate; }, [playbackRate]);
+  useEffect(() => { globalProgressRef.current = globalProgress; }, [globalProgress]);
 
-  // Derived state
-  const totalVideos = videos.length;
-  const currentVideoObj = videos.find(v => v.id === currentVideo);
-  const currentVideoIndex = currentVideoObj ? videos.findIndex(v => v.id === currentVideo) : 0;
+  // --- MEMOIZED ACTIVE VIDEOS ---
+  // This cleanly slices the playlist for One-Shot mode without duplicating state arrays.
+  // useMemo prevents infinite re-renders by only recalculating when inputs change.
+// --- MEMOIZED ACTIVE VIDEOS ---
+  const activeVideos = useMemo(() => {
+    const limit = Number(oneShotLimit); // Safely convert to number
+    return isOneShotMode && limit > 0 ? videos.slice(0, limit) : videos;
+  }, [isOneShotMode, oneShotLimit, videos]);
+
+  const totalVideos = activeVideos.length;
+  const currentVideoObj = activeVideos.find(v => v.id === currentVideo);
+  const currentVideoIndex = currentVideoObj ? activeVideos.findIndex(v => v.id === currentVideo) : 0;
   const playlistProgressPercentage = totalVideos > 0 ? ((currentVideoIndex + 1) / totalVideos) * 100 : 0;
-  const scrubPercentage = totalGlobalDuration > 0 ? (globalProgress / totalGlobalDuration) * 100 : 0;
 
-  // --- CALCULATE CHAPTERS FOR TIMELINE ---
+  // Calculate Chapters based on ACTIVE videos
   let accumulatedTime = 0;
-  const oneShotChapters = videos.map((v) => {
+  const oneShotChapters = activeVideos.map((v) => {
     const start = accumulatedTime;
     accumulatedTime += v.durationSeconds;
-    const end = accumulatedTime;
-    return { ...v, globalStartTime: start, globalEndTime: end };
+    return { ...v, globalStartTime: start, globalEndTime: accumulatedTime };
   });
 
-  // Load YouTube API
+  // --- ONE-SHOT NAVIGATION CONTROLS ---
+  const skipToNextChapter = () => {
+    if (currentVideoIndex < activeVideos.length - 1) {
+      const nextChapterStart = oneShotChapters[currentVideoIndex + 1].globalStartTime;
+      seekToGlobalTime(nextChapterStart);
+    } else {
+      // If it's the last video, just skip to the very end
+      seekToGlobalTime(totalGlobalDuration);
+    }
+  };
+
+  const skipToPrevChapter = () => {
+    const currentChapter = oneShotChapters[currentVideoIndex];
+    if (!currentChapter) return;
+    
+    // Check how far we are into the current video
+    const timeInCurrent = globalProgressRef.current - currentChapter.globalStartTime;
+
+    if (timeInCurrent > 3 || currentVideoIndex === 0) {
+      // Restart current video
+      seekToGlobalTime(currentChapter.globalStartTime);
+    } else {
+      // Jump to previous video
+      const prevChapterStart = oneShotChapters[currentVideoIndex - 1].globalStartTime;
+      seekToGlobalTime(prevChapterStart);
+    }
+  };
+
   useEffect(() => {
     if (!window.YT) {
       const tag = document.createElement("script");
@@ -55,50 +97,39 @@ export default function Home() {
     }
   }, []);
 
-  // Calculate Total Global Duration
+  // Use activeVideos for total duration
   useEffect(() => {
-    if (videos.length > 0) {
-      const totalSecs = videos.reduce((acc, v) => acc + v.durationSeconds, 0);
-      setTotalGlobalDuration(totalSecs);
+    if (activeVideos.length > 0) {
+      setTotalGlobalDuration(activeVideos.reduce((acc, v) => acc + v.durationSeconds, 0));
     }
-  }, [videos]);
+  }, [activeVideos]);
 
-  // Polling for Global Progress in One-Shot Mode
-  useEffect(() => {
-    if (isOneShotMode && isPlaying) {
-      progressIntervalRef.current = setInterval(() => {
-        if (!playerRef.current || typeof playerRef.current.getCurrentTime !== 'function') return; 
-
-        const currentTime = playerRef.current.getCurrentTime();
-        let passedTime = 0;
-        for (let i = 0; i < currentVideoIndex; i++) {
-          passedTime += videos[i].durationSeconds;
-        }
-        setGlobalProgress(passedTime + currentTime);
-      }, 500);
-    } else {
-      if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
-    }
-    return () => { if (progressIntervalRef.current) clearInterval(progressIntervalRef.current); };
-  }, [isOneShotMode, isPlaying, currentVideoIndex, videos]);
-
-  // --- UNIFIED SEEKING LOGIC (Mouse & Keyboard) ---
   const seekToGlobalTime = useCallback((newGlobalTime) => {
     setGlobalProgress(newGlobalTime);
+    globalProgressRef.current = newGlobalTime; // Instant update prevents arrow-key lag
+    
+    // Safety check: Prevent seeking past the very end
+    if (newGlobalTime >= totalGlobalDuration && totalGlobalDuration > 0) {
+        const lastVid = activeVideos[activeVideos.length - 1];
+        if (lastVid.id !== currentVideo) setCurrentVideo(lastVid.id);
+        if (playerRef.current) playerRef.current.seekTo(lastVid.durationSeconds, true);
+        return;
+    }
+
     let accumTime = 0;
     let targetVideoIndex = 0;
     let relativeTimeInVideo = 0;
 
-    for (let i = 0; i < videos.length; i++) {
-      if (accumTime + videos[i].durationSeconds > newGlobalTime) {
+    for (let i = 0; i < activeVideos.length; i++) {
+      if (accumTime + activeVideos[i].durationSeconds > newGlobalTime) {
         targetVideoIndex = i;
         relativeTimeInVideo = newGlobalTime - accumTime;
         break;
       }
-      accumTime += videos[i].durationSeconds;
+      accumTime += activeVideos[i].durationSeconds;
     }
 
-    const targetVideo = videos[targetVideoIndex];
+    const targetVideo = activeVideos[targetVideoIndex];
 
     if (targetVideo && targetVideo.id !== currentVideo) {
       setCurrentVideo(targetVideo.id);
@@ -110,49 +141,73 @@ export default function Home() {
         playerRef.current.seekTo(relativeTimeInVideo, true);
       }
     }
-  }, [videos, currentVideo]);
+  }, [activeVideos, currentVideo, totalGlobalDuration]);
 
-  const handleGlobalScrub = (e) => seekToGlobalTime(parseFloat(e.target.value));
-
-  // --- GLOBAL KEYBOARD SHORTCUTS ---
+  // --- UPDATED KEYBOARD SHORTCUTS ---
   useEffect(() => {
     const handleKeyDown = (e) => {
-      if (document.activeElement?.tagName === 'INPUT') return;
+      if (document.activeElement?.tagName === 'INPUT' || document.activeElement?.tagName === 'TEXTAREA') return;
       const player = playerRef.current;
       if (!player || typeof player.getPlayerState !== 'function') return;
 
-      const getCurrentGlobalTime = () => {
-        let passed = 0;
-        for (let i = 0; i < currentVideoIndex; i++) { passed += videos[i].durationSeconds; }
-        return passed + player.getCurrentTime();
-      };
-
       switch (e.key.toLowerCase()) {
-        case ' ':
+        case ' ': 
           e.preventDefault(); 
-          if (player.getPlayerState() === window.YT.PlayerState.PLAYING) { player.pauseVideo(); setIsPlaying(false); } 
+          if (player.getPlayerState() === window.YT.PlayerState.PLAYING) {
+            player.pauseVideo(); setIsPlaying(false);
+          } else {
+            player.playVideo(); setIsPlaying(true);
+          }
+          break;
+        case 'k': 
+          e.preventDefault();
+          if (isPlaying) { player.pauseVideo(); setIsPlaying(false); } 
           else { player.playVideo(); setIsPlaying(true); }
           break;
-        case 'm':
+        case 'arrowright': 
           e.preventDefault();
-          if (player.isMuted()) { player.unMute(); setIsMuted(false); } 
-          else { player.mute(); setIsMuted(true); }
-          break;
-        case 'arrowright':
-          e.preventDefault();
-          if (isOneShotMode) seekToGlobalTime(Math.min(totalGlobalDuration, getCurrentGlobalTime() + 10));
+          if (isOneShotMode) seekToGlobalTime(Math.min(totalGlobalDuration, globalProgressRef.current + 10));
           else player.seekTo(player.getCurrentTime() + 10, true);
           break;
-        case 'arrowleft':
+        case 'arrowleft': 
           e.preventDefault();
-          if (isOneShotMode) seekToGlobalTime(Math.max(0, getCurrentGlobalTime() - 10));
+          if (isOneShotMode) seekToGlobalTime(Math.max(0, globalProgressRef.current - 10));
           else player.seekTo(player.getCurrentTime() - 10, true);
+          break;
+        case 'm': 
+          e.preventDefault();
+          if (isMuted) { player.unMute(); setIsMuted(false); } 
+          else { player.mute(); setIsMuted(true); }
+          break;
+        case 'f': 
+          e.preventDefault();
+          const container = document.getElementById('player-container');
+          if (!document.fullscreenElement) container.requestFullscreen();
+          else document.exitFullscreen();
           break;
       }
     };
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
-  }, [isOneShotMode, totalGlobalDuration, currentVideoIndex, videos, seekToGlobalTime]);
+  }, [isOneShotMode, totalGlobalDuration, seekToGlobalTime, isPlaying, isMuted]);
+
+  // Polling for Global Progress
+  useEffect(() => {
+    if (isOneShotMode && isPlaying) {
+      progressIntervalRef.current = setInterval(() => {
+        if (!playerRef.current || typeof playerRef.current.getCurrentTime !== 'function') return; 
+        const currentTime = playerRef.current.getCurrentTime();
+        let passedTime = 0;
+        for (let i = 0; i < currentVideoIndex; i++) passedTime += activeVideos[i].durationSeconds;
+        setGlobalProgress(passedTime + currentTime);
+      }, 500);
+    } else {
+      if (progressIntervalRef.current) clearInterval(progressIntervalRef.current);
+    }
+    return () => { if (progressIntervalRef.current) clearInterval(progressIntervalRef.current); };
+  }, [isOneShotMode, isPlaying, currentVideoIndex, activeVideos]);
+
+  const handleGlobalScrub = (e) => seekToGlobalTime(parseFloat(e.target.value));
 
   const updatePlaybackSpeed = useCallback((newSpeed) => {
     setPlaybackRate(newSpeed);
@@ -168,11 +223,7 @@ export default function Home() {
         if (playerRef.current) playerRef.current.destroy();
         playerRef.current = new window.YT.Player("youtube-player", {
           videoId: currentVideo,
-          playerVars: {
-            rel: 0, modestbranding: 1, 
-            controls: isOneShotMode ? 0 : 1, 
-            disablekb: isOneShotMode ? 1 : 0, 
-          },
+          playerVars: { rel: 0, modestbranding: 1, controls: isOneShotMode ? 0 : 1, disablekb: isOneShotMode ? 1 : 0 },
           events: {
             'onReady': (event) => {
               event.target.setPlaybackRate(rateRef.current);
@@ -184,15 +235,17 @@ export default function Home() {
               } else setIsPlaying(false);
               
               if (event.data === window.YT.PlayerState.ENDED && autoplay) {
-                const nextIdx = (currentVideoIndex + 1) % videos.length;
-                setCurrentVideo(videos[nextIdx].id);
-                playerRef.current.loadVideoById(videos[nextIdx].id); 
+                // Safely jump to next video using activeVideos boundary
+                const nextIdx = currentVideoIndex + 1;
+                if (nextIdx < activeVideos.length) {
+                  setCurrentVideo(activeVideos[nextIdx].id);
+                  playerRef.current.loadVideoById(activeVideos[nextIdx].id); 
+                }
               }
             },
           },
         });
       };
-
       if (playerRef.current && playerRef.current.getIframe()) {
         const iframeSrc = playerRef.current.getIframe().src;
         if ((iframeSrc.includes('controls=0') ? 0 : 1) === (isOneShotMode ? 0 : 1)) {
@@ -201,8 +254,9 @@ export default function Home() {
         } else initPlayer(); 
       } else initPlayer(); 
     }
-  }, [currentVideo, isOneShotMode]); 
+  }, [currentVideo, isOneShotMode, activeVideos, autoplay, currentVideoIndex]); 
 
+  // ... (Keep your togglePlayPause, toggleMute, formatSeconds, parseDuration, fetch details functions exact same here)
   const togglePlayPause = () => {
     if (!playerRef.current) return;
     if (isPlaying) playerRef.current.pauseVideo();
@@ -294,6 +348,7 @@ export default function Home() {
       const vids = await fetchAllPlaylistVideos(id, apiKey);
       if (!vids.length) throw new Error("No videos found."); 
       setVideos(vids);
+      setOneShotLimit(vids.length); // Initialize limit to full playlist
       setCurrentVideo(vids[0].id); 
       const details = await fetchPlaylistDetails(id, apiKey);
       setPlaylistName(details.title);
@@ -312,10 +367,7 @@ export default function Home() {
   };
 
   return (
-    // 1. Removed h-screen and overflow-hidden to allow natural whole-page scrolling!
     <div className="bg-gray-950 min-h-screen text-white font-sans flex flex-col relative">
-      
-      {/* Navbar: Sticky to top */}
       <nav className="w-full sticky top-0 h-auto sm:h-[70px] min-h-[60px] bg-gray-950 flex flex-wrap items-center justify-between py-3 px-3 md:px-6 shadow-xl z-50 border-b border-gray-800 gap-3">
         <h1 className="text-lg md:text-2xl font-bold bg-gradient-to-r from-indigo-400 to-purple-500 bg-clip-text text-transparent whitespace-nowrap">
           Play-View
@@ -334,9 +386,44 @@ export default function Home() {
           </button>
         </div>
 
-        {/* Mode Toggles */}
         {videos.length > 0 && (
-          <div className="flex bg-gray-800 p-1 rounded-lg border border-gray-700 shrink-0">
+          <div className="flex gap-2 bg-gray-800 p-1 rounded-lg border border-gray-700 shrink-0">
+            {/* NEW: Custom Limit Input for One-Shot mode */}
+            {isOneShotMode && (
+              <div 
+                className="flex items-center gap-1.5 bg-gray-900 text-xs text-white border border-gray-600 rounded px-2 py-1" 
+                title="Set custom number of videos for One-Shot"
+              >
+                <span className="text-gray-400 font-medium">Limit:</span>
+                <input
+                  type="number"
+                  min="1"
+                  max={videos.length}
+                  value={oneShotLimit}
+                  onChange={(e) => {
+                    // Allow the field to be empty temporarily while typing
+                    if (e.target.value === "") {
+                      setOneShotLimit("");
+                      return;
+                    }
+                    // Parse the number and restrict it to valid bounds
+                    const val = parseInt(e.target.value, 10);
+                    if (!isNaN(val)) {
+                      setOneShotLimit(Math.min(Math.max(val, 1), videos.length));
+                    }
+                  }}
+                  onBlur={(e) => {
+                    // If the user clicks away while the input is empty, reset to total videos
+                    if (!e.target.value || e.target.value < 1) {
+                      setOneShotLimit(videos.length);
+                    }
+                  }}
+                  className="bg-transparent outline-none w-10 text-center font-mono text-indigo-300 placeholder-gray-500"
+                />
+                <span className="text-gray-400 font-medium">/ {videos.length}</span>
+              </div>
+            )}
+
             <button 
               onClick={() => setIsOneShotMode(false)}
               className={`flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs md:text-sm font-medium transition-all ${!isOneShotMode ? 'bg-gray-700 text-white shadow' : 'text-gray-400 hover:text-white'}`}
@@ -353,39 +440,22 @@ export default function Home() {
         )}
       </nav>
 
-      {/* 2. MAIN LAYOUT: Adapts flow based on mode */}
       <div className={`flex flex-1 w-full items-start ${isOneShotMode ? 'flex-col' : 'flex-col lg:flex-row'}`}>
-        
-        {/* Left Column (Video + Chapters/Status) */}
         <div className={`flex flex-col w-full ${isOneShotMode ? '' : 'lg:w-[65%] xl:w-[70%]'}`}>
           
-          {/* VIDEO AREA */}
-          <div className={`w-full bg-black shadow-2xl border-b border-gray-800 flex justify-center 
-            ${isOneShotMode ? '' : 'lg:sticky lg:top-[70px] z-40'}
-          `}>
-            
-            {/* 3. THE MATHEMATICAL SIZE LIMIT: Prevents height overflow by tying max-width to the screen height! */}
+          <div className={`w-full bg-black shadow-2xl border-b border-gray-800 flex justify-center ${isOneShotMode ? '' : 'lg:sticky lg:top-[70px] z-40'}`}>
             <div 
               id="player-container" 
               className="relative w-full aspect-video bg-black overflow-hidden group"
-              style={isOneShotMode ? { 
-                maxHeight: 'calc(100vh - 70px)', 
-                maxWidth: 'calc((100vh - 70px) * 16 / 9)', 
-                margin: '0 auto' 
-              } : {}}
+              style={isOneShotMode ? { maxHeight: 'calc(100vh - 70px)', maxWidth: 'calc((100vh - 70px) * 16 / 9)', margin: '0 auto' } : {}}
             >
               <div id="youtube-player" className="absolute inset-0 w-full h-full pointer-events-auto"></div>
               
-              {/* Custom Control Bar overlay for One-Shot Mode */}
               {isOneShotMode && (
                 <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/90 via-black/60 to-transparent pt-12 pb-4 px-4 lg:px-6 opacity-0 group-hover:opacity-100 transition-opacity duration-300">
-                  
-                  {/* --- TRUE SEGMENTED TIMELINE --- */}
                   <div className="flex items-center gap-2 lg:gap-4 mb-3 group/slider">
                     <span className="text-[10px] lg:text-xs font-medium w-10 text-right text-white/90">{formatSeconds(globalProgress)}</span>
-                    
                     <div className="relative flex-1 flex items-center h-4">
-                      {/* Visual Segmented Track */}
                       <div className="absolute left-0 right-0 top-1/2 -translate-y-1/2 h-1 lg:h-1.5 flex z-10 pointer-events-none group-hover/slider:h-2 transition-all duration-300">
                         {oneShotChapters.map((chap) => {
                           const widthPct = (chap.durationSeconds / totalGlobalDuration) * 100;
@@ -402,8 +472,6 @@ export default function Home() {
                           );
                         })}
                       </div>
-
-                      {/* Interactive Slider Thumb */}
                       <input 
                         type="range" min="0" max={totalGlobalDuration || 1} value={globalProgress} onChange={handleGlobalScrub}
                         className="absolute inset-0 w-full h-full opacity-100 z-20 cursor-pointer appearance-none bg-transparent 
@@ -413,16 +481,36 @@ export default function Home() {
                     </div>
                     <span className="text-[10px] lg:text-xs font-medium w-10 text-white/90">{formatSeconds(totalGlobalDuration)}</span>
                   </div>
-
-                  {/* Controls */}
                   <div className="flex items-center justify-between">
+                    {/* --- PLAYBACK CONTROLS --- */}
                     <div className="flex items-center gap-4 lg:gap-6">
-                      <button onClick={togglePlayPause} className="hover:text-indigo-400 transition-colors">
+                      
+                      {/* Previous Chapter Button */}
+                      <button onClick={skipToPrevChapter} className="hover:text-indigo-400 transition-colors disabled:opacity-50" title="Previous Video">
+                        <SkipBack className="w-4 h-4 lg:w-5 lg:h-5 fill-current" />
+                      </button>
+
+                      {/* Play/Pause Button */}
+                      <button onClick={togglePlayPause} className="hover:text-indigo-400 transition-colors scale-110">
                         {isPlaying ? <Pause className="w-5 h-5 lg:w-6 lg:h-6 fill-current" /> : <Play className="w-5 h-5 lg:w-6 lg:h-6 fill-current" />}
                       </button>
-                      <button onClick={toggleMute} className="hover:text-indigo-400 transition-colors">
+
+                      {/* Next Chapter Button */}
+                      <button 
+                        onClick={skipToNextChapter} 
+                        disabled={currentVideoIndex >= activeVideos.length - 1 && globalProgress >= totalGlobalDuration}
+                        className="hover:text-indigo-400 transition-colors disabled:opacity-50" 
+                        title="Next Video"
+                      >
+                        <SkipForward className="w-4 h-4 lg:w-5 lg:h-5 fill-current" />
+                      </button>
+
+                      {/* Mute Button */}
+                      <button onClick={toggleMute} className="hover:text-indigo-400 transition-colors ml-2">
                         {isMuted ? <VolumeX className="w-4 h-4 lg:w-5 lg:h-5" /> : <Volume2 className="w-4 h-4 lg:w-5 lg:h-5" />}
                       </button>
+
+                      {/* Current Topic Title */}
                       <div className="flex items-center gap-2 border-l border-white/20 pl-4 lg:pl-6 hidden sm:flex">
                          <span className="text-xs lg:text-sm font-medium text-white/70 tracking-wide truncate max-w-[150px] lg:max-w-xs">
                            Topic: {currentVideoObj?.title}
@@ -443,11 +531,8 @@ export default function Home() {
             </div>
           </div>
 
-          {/* BELOW VIDEO AREA (Chapters flow naturally down the page) */}
           <div className="w-full bg-gray-950 p-4 lg:p-6">
-            
-            {/* ONE-SHOT MODE: Timeline Chapters Grid */}
-            {isOneShotMode && videos.length > 0 && (
+            {isOneShotMode && activeVideos.length > 0 && (
               <div className="w-full">
                 <h3 className="text-lg font-bold mb-4 text-white/90 flex items-center gap-2">
                   <MapPin className="w-5 h-5 text-indigo-400" />
@@ -481,7 +566,6 @@ export default function Home() {
               </div>
             )}
             
-            {/* PLAYLIST MODE: Status Bar */}
             {!isOneShotMode && totalVideos > 0 && (
               <div className="w-full bg-gray-900 p-4 rounded-xl border border-gray-800">
                  <div className="flex justify-between text-sm text-gray-400 mb-2">
@@ -496,11 +580,8 @@ export default function Home() {
           </div>
         </div>
 
-        {/* Right Column: Playlist Sidebar (Only visible in Playlist Mode) */}
-        {!isOneShotMode && videos.length > 0 && (
+        {!isOneShotMode && activeVideos.length > 0 && (
           <div className="w-full lg:w-[35%] xl:w-[30%] bg-gray-950 border-t lg:border-t-0 lg:border-l border-gray-800 flex flex-col">
-            
-            {/* Sticky Header */}
             <div className="sticky top-[70px] z-30 p-3 lg:p-4 border-b border-gray-800 bg-gray-950 flex justify-between items-center">
               <h2 className="text-base font-semibold truncate pr-2">{playlistName || "Playlist Queue"}</h2>
               <div className="flex items-center gap-2 shrink-0">
@@ -513,9 +594,8 @@ export default function Home() {
               </div>
             </div>
 
-            {/* List scrolls naturally with the page */}
             <div className="p-2 lg:p-3 space-y-1.5 h-[200px] overflow-y-auto no-scrollbar">
-              {videos.map((v, i) => {
+              {activeVideos.map((v, i) => {
                 const isActive = currentVideo === v.id;
                 return (
                   <div
