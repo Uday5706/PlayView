@@ -236,7 +236,7 @@ export default function Home() {
         if (playerRef.current) playerRef.current.destroy();
         playerRef.current = new window.YT.Player("youtube-player", {
           videoId: currentVideo,
-          playerVars: { rel: 0, modestbranding: 1, controls: isOneShotMode ? 0 : 1, disablekb: isOneShotMode ? 1 : 0 },
+          playerVars: { rel: 0, modestbranding: 1, controls: isOneShotMode ? 0 : 1, disablekb: isOneShotMode ? 1 : 0,cc_load_policy: 0 },
           events: {
             'onReady': (event) => {
               event.target.setPlaybackRate(rateRef.current);
